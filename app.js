@@ -1,7 +1,13 @@
 require('dotenv').config();
 const fs = require('fs');
 const mongoose = require('mongoose');
+const mysql = require('mysql');
 const msg = require("./msg"); // 스키마 불러오기
+
+const moment = require('moment');
+require('moment-timezone');
+moment.tz.setDefault("Asia/Seoul");
+
 const configs = {
   mongo: {
     user: process.env.MONGO_USER, //user: 'root',
@@ -9,8 +15,15 @@ const configs = {
     useNewUrlParser: true,
     useUnifiedTopology: true 
   },
+  mysql: {
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_SCHEMA,
+    connectionLimit: 30
+  },
   mongoUri: process.env.MONGO_URI,
-  port: 3001,
+  port: Number(process.env.SOCKET_PORT) || 3000,
   socketIo: {
     cors: {
       origin: "*",
@@ -21,6 +34,7 @@ const configs = {
 const info = {
   chatDB_connect: false // 몽고DB 커넥션에 따라 DB접근 분기
 }
+
 const server = () => {
   if (process.env.NODE_ENV === 'production') {
     console.log('Use SSL');
@@ -46,6 +60,7 @@ const connectMongoDB = () => {
       console.error(err);   // throw err;
     }
     else {
+      info.chatDB_connect = true;
       console.log('[Step 3] MongoDB Connect');
     }
   });
@@ -53,24 +68,81 @@ const connectMongoDB = () => {
   return mongoose.connection;
 }
 console.log('MongoDB Connecting');
-const database = connectMongoDB();
+const MongoDB = connectMongoDB();
+
+const database= mysql.createPool(configs.mysql);
+database.getConnection(function (err) {
+  if (err) {
+    console.error('error connecting: ' + err.stack);
+    return;
+  }
+
+  console.log('[Step 4] MySQL Connect');
+  console.log('connected as id ' + database.threadId);
+});
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 const messageQueue = new Array();
+const mongoMsgs = new Map();
+const userCache = new Map();
+
+const getUser = (userId) => {
+  if(userCache.has(userId)) {
+    const user = userCache.get(userId);
+    return user.url;
+  }
+
+  database.query('SELECT xe_files.path, xe_files.filename FROM xe_user, xe_files WHERE xe_user.id = ? AND xe_user.profile_image_id = xe_files.id',
+    [userId]
+    , (error, results, fields) => {
+      if(error) {
+        console.log(error);
+      }
+      if(results.length > 0) {
+        userCache.set(userId, {url: '/storage/app/' + results[0].path + '/' + results[0].filename, last_use: new Date()});
+      }
+    }
+  );
+
+  
+  return "";
+}
+
+// setInterval(() => {
+//   const now = new Date();
+
+//   for (const user of userCache) {
+//     const date = new Date(user[1].last_use);
+//     date.setDate(date.getDate()+3);
+//     date.setHours(0,0,0,0);
+//     if(date < now) {
+//       userCache.remove(user[0]);
+//     }
+//   }
+// }, 1000*60*60*12*3);
+
+
+
 io.sockets.on('connection', (socket) => {
   console.log('New Connect Socket :: ' + socket.id);
   const headers = socket.handshake.headers; // 소켓 헤더
+  console.log(headers);
   if(headers.auth) { // 헤더에 auth가 있으면 정보 기입
-    socket.auth = headers.auth;
-    userMap.set(socket.auth.userId, socket.auth);
+    socket.auth = JSON.parse(headers.auth);
+    console.log(headers);
+    // userMap.set(socket.auth.userId, socket.auth);
   }
   else { // 없으면 Guest 설정
     socket.auth = {
       userId: 'guest-' + new Date().getTime(),
-      displayname: 'guest'
+      displayname: 'guest',
+      isGuest: true
     }
   }
+  console.log(socket.auth);
   socket.otherRooms = []; // 다른 방 메시지 구독 리스트 [roomId]
   socket.lastMsgByRoom = new Map(); // 룸별로 마지막으로 읽은 메시지 id 저장 (roomId - msgId)
+  socket.prevMsgByRoom = new Map();
   /**
    * socket에 사용자 계정정보 저장 이벤트 -> complete 이벤트로 반환
    */
@@ -80,6 +152,10 @@ io.sockets.on('connection', (socket) => {
     }
     if(data.userId) {
       socket.auth.userId = data.userId;
+      socket.auth.isGuest = false;
+    }
+    if(data.profileImage) {
+      socket.auth.profileImage = data.profileImage;
     }
     socket.emit('complete', {type: 'setAuth', status: true});
   });
@@ -91,6 +167,7 @@ io.sockets.on('connection', (socket) => {
     socket.emit('complete', {type: 'leaveRoom', roomId: data.roomId, status: true});
   });
   socket.on('joinRoom', (data) => { // {roomId}
+    socket.roomId = data.roomId;
     socket.join(data.roomId);
     socket.emit('complete', {type: 'joinRoom', roomId: data.roomId, status: true});
   });
@@ -126,6 +203,7 @@ io.sockets.on('connection', (socket) => {
   });
   // 마지막으로 받은 메시지를 서버에 저장
   socket.on('receive', (data) => {
+    if(!data.roomId) return;
     socket.lastMsgByRoom.set(data.roomId, data.msgId);
   })
   /**
@@ -139,6 +217,7 @@ io.sockets.on('connection', (socket) => {
     // console.log('listSocket', io.sockets.sockets);
   });
   socket.on('disconnect', () => {
+    
   });
 });
 function includesArray(origin, finds) {
@@ -149,12 +228,19 @@ function includesArray(origin, finds) {
 }
 // 채팅
 const sendChat = (socket, roomId, content) => {
+  console.log(roomId, content);
+
+  if(!socket.auth.isGuest) {
+    userCache.set(socket.auth.userId, {url: socket.auth.profileImage, last_use: new Date()});
+  }
+
   if(!info.chatDB_connect) {
     const data = {
       "msgId": new Date().getTime(),
       "roomId": roomId,
       "userId": socket.auth.userId,
-      "name": socket.auth.displayname,
+      "displayname": socket.auth.displayname,
+      "profileImage": userCache.get(socket.auth.userId),
       "content": content,
       "time": Date.now(),
     }
@@ -162,52 +248,129 @@ const sendChat = (socket, roomId, content) => {
     messageQueue.push({...data, type: "chat"});
     return;
   }
-  msg.find({room: data.roomId}).then(row => {
-    new msg({
-      _id: row.length === 0 ? 1 : row[0]._id,
-      room: roomId,
-      uuId: socket.auth.userId,
-      name: socket.auth.displayname,
-      content: content,
-    })
-    .save((error, saveData) => {
-      if(error) {
-        console.error(error);
-        return;
-      }
-      const data = {
-        "msgId": saveData._id,
-        "roomId": roomId,
-        "userId": socket.auth.userId,
-        "name": socket.auth.displayname,
-        "content": content,
-        "time": Date.now(),
-      }
-      io.to(roomId).emit('msg', {...data, type: "chat"});
-      messageQueue.push({...data, type: "chat"});
-    });
-  });
+
+  if(mongoMsgs.has(roomId)) {
+    mongoMsgs.get(roomId).push({socket, content, time: new Date()});
+  }
+  else {
+    mongoMsgs.set(roomId, [{socket, content, time: new Date()}]);
+  }
 }
+
+
+(() => {
+  let roomSize = 0;
+  let goal = 0;
+
+  setInterval(() => {
+    if(roomSize != goal) return;
+    roomSize = 0;
+    goal = mongoMsgs.size;
+    if(goal === 0) return;
+
+    console.log('process');
+
+    for (const roomMsgs of mongoMsgs) {
+      const mongoMsgQueue = roomMsgs[1];
+      const roomId = roomMsgs[0];
+
+      msg.find({room: roomId}).sort({msg_id: -1}).limit(1).then(row => {
+        const id = row.length === 0 ? 0 : row[0].msg_id;
+        const size = mongoMsgQueue.length;
+        const msgs = [];
+        console.log('find', size, id);
+
+        for(let i=0; i<size; i++) {
+          msgs.push({
+            msg_id: id+i+1,
+            room: roomId,
+            uuId: mongoMsgQueue[i].socket.auth.userId,
+            displayname: mongoMsgQueue[i].socket.auth.displayname,
+            content: mongoMsgQueue[i].content,
+            time: mongoMsgQueue[i].time
+          });
+
+          const data = {
+            msgId: id+i+1,
+            roomId: roomId,
+            userId: mongoMsgQueue[i].socket.auth.userId,
+            profileImage: getUser(mongoMsgQueue[i].socket.auth.userId),
+            displayname: mongoMsgQueue[i].socket.auth.displayname,
+            content: mongoMsgQueue[i].content,
+            time: mongoMsgQueue[i].time,
+          }
+
+          io.to(roomId).emit('msg', {...data, type: "chat"});
+          messageQueue.push({...data, type: "chat"});
+        }
+
+        msg.insertMany(msgs).then((res) => {
+          const msgRoom = mongoMsgs.get(roomId);
+
+          if(msgRoom.length - size === 0) {
+            mongoMsgs.delete(roomId);
+          }
+          else {
+            mongoMsgs.set(roomId, msgRoom.slice(size));
+          }
+
+          console.log('size', ++roomSize, id+size);
+
+          const lastMessage = msgs[size-1];
+
+          if(!lastMessage.content.text) {
+            database.query('UPDATE xe_chat_rooms SET last_message_id = ?, last_message_time = ? WHERE id = ? AND last_message_id < ?',
+              [lastMessage.msg_id, lastMessage.time, roomId, lastMessage.msg_id],
+              (error, results, fields) => {
+                if(error) {
+                  console.log(error);
+                }
+              }
+            );
+
+          }
+          else {
+            database.query('UPDATE xe_chat_rooms SET last_message = ?, last_message_id = ?, last_message_time = ? WHERE id = ? AND last_message_id < ?',
+              [lastMessage.content.text, lastMessage.msg_id, lastMessage.time, roomId, lastMessage.msg_id],
+              (error, results, fields) => {
+                if(error) {
+                  console.log(error);
+                }
+              }
+            );
+          }
+          
+        });
+      });
+    }
+  }, 100);
+})();
+
+
 const getHistory = (socket, roomId, first, lastMsg, count = 40) => {
+  // console.log(roomId, first, lastMsg, count)
+
+  if(!roomId) return;
+
   if(first) {
-    msg.find({room: roomId}).sort({time: -1}).limit(count).then(history => {
+    msg.find({room: roomId}).sort({msg_id: -1}).limit(count).then(history => {
       if(Array.isArray(history) && history.length === 0) {
         return;
       }
       const messages = history.map(chat =>
         ({
-          "msgId": chat._id,
+          "msgId": chat.msg_id,
           "roomId": chat.room,
           "userId": chat.uuId,
-          "name":chat.name,
+          "displayname":chat.displayname,
           "content": chat.content,
+          "profileImage": getUser(chat.uuId) || "",
           "time": chat.time
         })
-      )
+      );
       socket.emit('history',
         {
           "roomId": roomId,
-          "lastMsg": messages[0].time,
           "messages": messages,
           "isFirst": true
         }
@@ -215,25 +378,25 @@ const getHistory = (socket, roomId, first, lastMsg, count = 40) => {
     }).catch(err => {console.error(err)});
     return;  
   }
-  msg.find({room: roomId}).where('_id').lt(lastMsg).sort({time: -1}).limit(count).then(history => {
+  msg.find({room: roomId}).where('msg_id').lt(lastMsg).limit(count).then(history => {
     if(Array.isArray(history) && history.length === 0) {
       return;
     }
     const messages = history.map(chat =>
       ({
-        "msgId": chat._id,
+        "msgId": chat.msg_id,
         "roomId": chat.room,
         "userId": chat.uuId,
-        "name": chat.name,
+        "displayname": chat.displayname,
         "content": chat.content,
         "time": chat.time
       })
-    ).reverse();
+    );
     socket.emit('history',
       {
-        "lastMsg": messagese[0].msgId,
         "messages": messages,
-        "isFirst": true
+        "isFirst": false,
+        "roomId": roomId
       }
     );
   }).catch(err => {console.error(err)});
@@ -260,7 +423,7 @@ const sendRoom = (socket, roomId, content) => {
 }
 // 소켓 브로드캐스트
 const sendBroadcast = (socket, content) => {
-  socket.broadcast.emit('msg',
+  io.emit('msg',
     {
       displayname: socket.auth.displayname,
       userId: socket.auth.userId,
@@ -269,6 +432,36 @@ const sendBroadcast = (socket, content) => {
     }
   );
 }
+
+
+(function () {
+  let lock = false;
+  setInterval(() => {
+    if(lock) return;
+    lock = true;
+
+    for(const socket of io.sockets.sockets) {
+      if(socket[1].auth.isGuest) continue;
+      for(const roomMsg of socket[1].lastMsgByRoom) {
+        // console.log("roomMsg", socket[1].lastMsgByRoom);
+        if(socket[1].prevMsgByRoom.get(roomMsg[0]) === roomMsg[1]) continue;
+        // console.log([roomMsg[1], roomMsg[0], socket[1].auth.userId]);
+
+        database.query('UPDATE `xe_chat_room_user` SET `last_message_id` = ? WHERE `chat_room_id` = ? AND `user_id` = ?',
+          [roomMsg[1], roomMsg[0], socket[1].auth.userId]
+          , (error, results, fields) => {
+            if(error) {
+              console.log(error);
+            }
+            socket[1].prevMsgByRoom.set(roomMsg[0], roomMsg[1]);
+          }
+        );
+      }
+    }
+    lock = false;
+  }, 2000);
+})();
+
 /**
  * [클라이언트] 채팅방 리스트 내에 있는 방 채팅 수신
  */
@@ -281,19 +474,20 @@ const sendBroadcast = (socket, content) => {
     for(let i=0; messageQueue.length; i++) {
       const message = messageQueue.shift();
       for(const socket of io.sockets.sockets) {
-        if(includesArray(socket[1].otherRooms, ['manager', message.roomId])) {
+        if(socket[1].otherRooms && includesArray(socket[1].otherRooms, ['manager', message.roomId])) {
           if(message.msgId > (socket[1].lastMsgByRoom.get(message.roomId) || 0)) {
             if(socketMsgs.has(socket[0])) {
               socketMsgs.get(socket[0]).messages.push(message);
             }
             else {
-              socketMsgs.set({socket: socket[1], messages: [message]});
+              socketMsgs.set(socket[0], {socket: socket[1], messages: [message]});
             }
           }
         }
       }
     }
     for(const socketMsg of socketMsgs) {
+      // console.log(socketMsg);
       socketMsg[1].socket.emit('msg', {content: socketMsg[1].messages, type: 'chats'});
     }
     lock = false;
