@@ -1,0 +1,16 @@
+version: "3"
+services:
+  nodeapp:
+    build: 
+      context: .
+    command: ["nodemon", "-L", "app.js"]
+    environment:
+      TZ: "Asia/Seoul"
+    # ports:
+    #   - "3001:3000/tcp"
+    volumes:
+      - /etc/letsencrypt:/etc/letsencrypt
+      - .:/usr/src/app
+      - /usr/src/app/node_modules
+    restart: always
+    network_mode: "host"

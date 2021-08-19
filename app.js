@@ -4,10 +4,6 @@ const mongoose = require('mongoose');
 const mysql = require('mysql');
 const msg = require("./msg"); // 스키마 불러오기
 
-const moment = require('moment');
-require('moment-timezone');
-moment.tz.setDefault("Asia/Seoul");
-
 const configs = {
   mongo: {
     user: process.env.MONGO_USER, //user: 'root',
@@ -20,14 +16,17 @@ const configs = {
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
     database: process.env.DB_SCHEMA,
-    connectionLimit: 30
+    connectionLimit: 30,
+    charset : 'utf8mb4' // emoji 지원
   },
   mongoUri: process.env.MONGO_URI,
   port: Number(process.env.SOCKET_PORT) || 3000,
   socketIo: {
     cors: {
       origin: "*",
-      methods: ["GET", "POST"]
+      methods: ["GET", "POST"],
+      transports: ["websocket"],
+      credentials: true
     }
   }
 }
@@ -35,7 +34,7 @@ const info = {
   chatDB_connect: false // 몽고DB 커넥션에 따라 DB접근 분기
 }
 
-const server = () => {
+const server = () => { // HTTPS / HTTP 서버 분기
   if (process.env.NODE_ENV === 'production') {
     console.log('Use SSL');
     return require('https').createServer({
@@ -70,7 +69,7 @@ const connectMongoDB = () => {
 console.log('MongoDB Connecting');
 const MongoDB = connectMongoDB();
 
-const database= mysql.createPool(configs.mysql);
+const database = mysql.createPool(configs.mysql);
 database.getConnection(function (err) {
   if (err) {
     console.error('error connecting: ' + err.stack);
@@ -103,33 +102,29 @@ const getUser = (userId) => {
       }
     }
   );
-
-  
   return "";
 }
 
-// setInterval(() => {
-//   const now = new Date();
+let timer = null;
+setInterval(() => {
+  if(timer) return;
+  const now = new Date();
+  const next = new Date(now.getTime());
+  next.setDate(next.getDate()+3)
+  next.setHours(0,0,0,0);
 
-//   for (const user of userCache) {
-//     const date = new Date(user[1].last_use);
-//     date.setDate(date.getDate()+3);
-//     date.setHours(0,0,0,0);
-//     if(date < now) {
-//       userCache.remove(user[0]);
-//     }
-//   }
-// }, 1000*60*60*12*3);
-
+  timer = setTimeout(() => {
+    userCache.clear();
+    timer = null;
+  },next.getTime() - now.getTime());
+}, 1000*60*60*12);
 
 
 io.sockets.on('connection', (socket) => {
   console.log('New Connect Socket :: ' + socket.id);
   const headers = socket.handshake.headers; // 소켓 헤더
-  console.log(headers);
   if(headers.auth) { // 헤더에 auth가 있으면 정보 기입
     socket.auth = JSON.parse(headers.auth);
-    console.log(headers);
     // userMap.set(socket.auth.userId, socket.auth);
   }
   else { // 없으면 Guest 설정
@@ -327,7 +322,6 @@ const sendChat = (socket, roomId, content) => {
                 }
               }
             );
-
           }
           else {
             database.query('UPDATE xe_chat_rooms SET last_message = ?, last_message_id = ?, last_message_time = ? WHERE id = ? AND last_message_id < ?',
@@ -339,21 +333,19 @@ const sendChat = (socket, roomId, content) => {
               }
             );
           }
-          
         });
       });
     }
-  }, 100);
+  }, 500);
 })();
 
 
 const getHistory = (socket, roomId, first, lastMsg, count = 40) => {
-  // console.log(roomId, first, lastMsg, count)
-
   if(!roomId) return;
 
   if(first) {
-    msg.find({room: roomId}).sort({msg_id: -1}).limit(count).then(history => {
+    msg.find({room: roomId}).sort({msg_id: -1}).limit(count)
+    .then(history => {
       if(Array.isArray(history) && history.length === 0) {
         return;
       }
@@ -368,6 +360,7 @@ const getHistory = (socket, roomId, first, lastMsg, count = 40) => {
           "time": chat.time
         })
       );
+      
       socket.emit('history',
         {
           "roomId": roomId,
@@ -378,7 +371,8 @@ const getHistory = (socket, roomId, first, lastMsg, count = 40) => {
     }).catch(err => {console.error(err)});
     return;  
   }
-  msg.find({room: roomId}).where('msg_id').lt(lastMsg).limit(count).then(history => {
+  msg.find({room: roomId}).where('msg_id').lt(lastMsg).sort({msg_id: -1}).limit(count)
+  .then(history => {
     if(Array.isArray(history) && history.length === 0) {
       return;
     }
@@ -434,7 +428,7 @@ const sendBroadcast = (socket, content) => {
 }
 
 
-(function () {
+(() => {
   let lock = false;
   setInterval(() => {
     if(lock) return;
@@ -443,9 +437,7 @@ const sendBroadcast = (socket, content) => {
     for(const socket of io.sockets.sockets) {
       if(socket[1].auth.isGuest) continue;
       for(const roomMsg of socket[1].lastMsgByRoom) {
-        // console.log("roomMsg", socket[1].lastMsgByRoom);
         if(socket[1].prevMsgByRoom.get(roomMsg[0]) === roomMsg[1]) continue;
-        // console.log([roomMsg[1], roomMsg[0], socket[1].auth.userId]);
 
         database.query('UPDATE `xe_chat_room_user` SET `last_message_id` = ? WHERE `chat_room_id` = ? AND `user_id` = ?',
           [roomMsg[1], roomMsg[0], socket[1].auth.userId]
@@ -459,13 +451,13 @@ const sendBroadcast = (socket, content) => {
       }
     }
     lock = false;
-  }, 2000);
+  }, 500);
 })();
 
 /**
  * [클라이언트] 채팅방 리스트 내에 있는 방 채팅 수신
  */
-(function () {
+(() => {
   let lock = false;
   setInterval(() => {
     if(lock) return;
@@ -487,9 +479,8 @@ const sendBroadcast = (socket, content) => {
       }
     }
     for(const socketMsg of socketMsgs) {
-      // console.log(socketMsg);
       socketMsg[1].socket.emit('msg', {content: socketMsg[1].messages, type: 'chats'});
     }
     lock = false;
-  }, 2000);
+  }, 1000);
 })();
